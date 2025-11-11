@@ -2,7 +2,10 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-import hydra
+try:
+    import hydra  # type: ignore
+except ImportError:  # pragma: no cover - hydra optional for agent use
+    hydra = None
 import numpy as np
 import torch
 import torch.nn as nn
