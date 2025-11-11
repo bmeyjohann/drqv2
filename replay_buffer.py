@@ -77,6 +77,12 @@ class ReplayBufferStorage:
         eps_fn = f'{ts}_{eps_idx}_{eps_len}.npz'
         save_episode(episode, self._replay_dir / eps_fn)
 
+    def num_episodes(self):
+        return self._num_episodes
+
+    def num_transitions(self):
+        return self._num_transitions
+
 
 class ReplayBuffer(IterableDataset):
     def __init__(self, replay_dir, max_size, num_workers, nstep, discount,
