@@ -177,7 +177,19 @@ class DrQV2Agent:
                 action.uniform_(-1.0, 1.0)
         return action.cpu().numpy()[0]
 
-    def update_critic(self, obs, action, reward, discount, next_obs, step):
+    def update_critic(
+        self,
+        obs,
+        action,
+        reward,
+        discount,
+        next_obs,
+        step,
+        pref_tensors=None,
+        pref_weight: float = 0.0,
+        pref_margin: float = 0.1,
+        pref_loss_type: str = "margin",
+    ):
         metrics = dict()
 
         with torch.no_grad():
@@ -191,11 +203,36 @@ class DrQV2Agent:
         Q1, Q2 = self.critic(obs, action)
         critic_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
 
+        pref_loss = None
+        if (
+            pref_tensors is not None
+            and pref_weight > 0.0
+            and isinstance(pref_tensors, tuple)
+            and len(pref_tensors) == 3
+        ):
+            pref_obs, pref_teacher_actions, pref_student_actions = pref_tensors
+            teacher_q1, teacher_q2 = self.critic(pref_obs, pref_teacher_actions)
+            student_q1, student_q2 = self.critic(pref_obs, pref_student_actions)
+            q_teacher = torch.min(teacher_q1, teacher_q2)
+            q_student = torch.min(student_q1, student_q2)
+            delta = q_teacher - q_student
+            if pref_loss_type == "bradley_terry":
+                pref_loss = F.softplus(-delta).mean()
+            else:
+                pref_loss = F.softplus(
+                    torch.as_tensor(pref_margin, device=delta.device, dtype=delta.dtype) - delta
+                ).mean()
+            critic_loss = critic_loss + float(pref_weight) * pref_loss
+
         if self.use_tb:
             metrics['critic_target_q'] = target_Q.mean().item()
             metrics['critic_q1'] = Q1.mean().item()
             metrics['critic_q2'] = Q2.mean().item()
             metrics['critic_loss'] = critic_loss.item()
+            if pref_loss is not None:
+                metrics['pref_loss'] = pref_loss.item()
+        elif pref_loss is not None:
+            metrics['pref_loss'] = pref_loss.item()
 
         # optimize encoder and critic
         self.encoder_opt.zero_grad(set_to_none=True)
@@ -230,7 +267,15 @@ class DrQV2Agent:
 
         return metrics
 
-    def update(self, replay_iter, step):
+    def update(
+        self,
+        replay_iter,
+        step,
+        pref_batch=None,
+        pref_weight: float = 0.0,
+        pref_margin: float = 0.1,
+        pref_loss_type: str = "margin",
+    ):
         metrics = dict()
 
         if step % self.update_every_steps != 0:
@@ -248,12 +293,38 @@ class DrQV2Agent:
         with torch.no_grad():
             next_obs = self.encoder(next_obs)
 
+        pref_tensors = None
+        if (
+            pref_batch is not None
+            and pref_weight > 0.0
+            and isinstance(pref_batch, tuple)
+            and len(pref_batch) == 3
+        ):
+            pref_obs_np, pref_teacher_np, pref_student_np = pref_batch
+            pref_obs = torch.as_tensor(pref_obs_np, device=self.device).float()
+            pref_teacher = torch.as_tensor(pref_teacher_np, device=self.device).float()
+            pref_student = torch.as_tensor(pref_student_np, device=self.device).float()
+            pref_obs = self.aug(pref_obs)
+            pref_obs = self.encoder(pref_obs)
+            pref_tensors = (pref_obs, pref_teacher, pref_student)
+
         if self.use_tb:
             metrics['batch_reward'] = reward.mean().item()
 
         # update critic
         metrics.update(
-            self.update_critic(obs, action, reward, discount, next_obs, step))
+            self.update_critic(
+                obs,
+                action,
+                reward,
+                discount,
+                next_obs,
+                step,
+                pref_tensors,
+                pref_weight,
+                pref_margin,
+                pref_loss_type,
+            ))
 
         # update actor
         metrics.update(self.update_actor(obs.detach(), step))

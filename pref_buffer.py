@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+import datetime
+import io
+import random
+from pathlib import Path
+from typing import Dict, Tuple
+
+import numpy as np
+
+
+def _save_chunk(chunk: Dict[str, np.ndarray], path: Path) -> None:
+    with io.BytesIO() as buffer:
+        np.savez_compressed(buffer, **chunk)
+        buffer.seek(0)
+        with path.open("wb") as fp:
+            fp.write(buffer.read())
+
+
+def _load_chunk(path: Path) -> Dict[str, np.ndarray]:
+    with path.open("rb") as fp:
+        data = np.load(fp)
+        return {k: data[k] for k in data.files}
+
+
+class PreferencePairStorage:
+    """Disk-backed preference pair storage mirroring the DrQ replay layout."""
+
+    def __init__(
+        self,
+        *,
+        obs_shape: Tuple[int, ...],
+        action_shape: Tuple[int, ...],
+        storage_dir: Path,
+        chunk_size: int = 64,
+    ):
+        self.obs_shape = tuple(obs_shape)
+        self.action_shape = tuple(action_shape)
+        self.storage_dir = storage_dir
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        self.chunk_size = max(1, int(chunk_size))
+        self._states: list[np.ndarray] = []
+        self._teacher_actions: list[np.ndarray] = []
+        self._student_actions: list[np.ndarray] = []
+        self._num_chunks = 0
+        self._num_pairs = 0
+        self._preload()
+
+    def _preload(self) -> None:
+        for fn in sorted(self.storage_dir.glob("*.npz")):
+            try:
+                _, idx_str, count_str = fn.stem.split("_")
+                idx = int(idx_str)
+                count = int(count_str)
+            except Exception:
+                continue
+            self._num_chunks = max(self._num_chunks, idx + 1)
+            self._num_pairs += count
+
+    def add(self, state: np.ndarray, teacher_action: np.ndarray, student_action: np.ndarray) -> None:
+        state_arr = np.asarray(state)
+        teacher_arr = np.asarray(teacher_action, dtype=np.float32)
+        student_arr = np.asarray(student_action, dtype=np.float32)
+        if state_arr.shape != self.obs_shape:
+            raise ValueError(f"Preference buffer state shape mismatch: expected {self.obs_shape}, got {state_arr.shape}")
+        if teacher_arr.shape != self.action_shape or student_arr.shape != self.action_shape:
+            raise ValueError("Preference buffer action shape mismatch")
+        self._states.append(state_arr.astype(np.uint8, copy=False))
+        self._teacher_actions.append(teacher_arr)
+        self._student_actions.append(student_arr)
+        if len(self._states) >= self.chunk_size:
+            self._flush_chunk()
+
+    def _flush_chunk(self) -> None:
+        if not self._states:
+            return
+        chunk = {
+            "states": np.stack(self._states, axis=0),
+            "teacher_actions": np.stack(self._teacher_actions, axis=0),
+            "student_actions": np.stack(self._student_actions, axis=0),
+        }
+        chunk_len = chunk["states"].shape[0]
+        timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        filename = self.storage_dir / f"{timestamp}_{self._num_chunks}_{chunk_len}.npz"
+        _save_chunk(chunk, filename)
+        self._num_chunks += 1
+        self._num_pairs += chunk_len
+        self._states.clear()
+        self._teacher_actions.clear()
+        self._student_actions.clear()
+
+    def num_pairs(self) -> int:
+        return self._num_pairs
+
+    def close(self) -> None:
+        self._flush_chunk()
+
+
+class PreferencePairDataset:
+    """Lazy loader that mirrors ReplayBuffer's disk-backed sampling semantics."""
+
+    def __init__(
+        self,
+        *,
+        storage_dir: Path,
+        max_size: int,
+        fetch_every: int = 512,
+    ):
+        self.storage_dir = storage_dir
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        self.max_size = max(1, int(max_size))
+        self.fetch_every = max(1, int(fetch_every))
+        self._samples_since_fetch = self.fetch_every
+        self._chunks: Dict[Path, Dict[str, np.ndarray]] = {}
+        self._chunk_order: list[Path] = []
+        self._size = 0
+
+    def _try_fetch(self) -> None:
+        if self._samples_since_fetch < self.fetch_every:
+            return
+        self._samples_since_fetch = 0
+        for fn in sorted(self.storage_dir.glob("*.npz")):
+            if fn in self._chunks:
+                continue
+            try:
+                _, _, count_str = fn.stem.split("_")
+                count = int(count_str)
+            except Exception:
+                continue
+            if count > self.max_size:
+                fn.unlink(missing_ok=True)
+                continue
+            while self._size + count > self.max_size and self._chunk_order:
+                old_fn = self._chunk_order.pop(0)
+                removed = self._chunks.pop(old_fn)
+                self._size -= removed["states"].shape[0]
+                old_fn.unlink(missing_ok=True)
+            chunk = _load_chunk(fn)
+            self._chunks[fn] = chunk
+            self._chunk_order.append(fn)
+            self._size += chunk["states"].shape[0]
+
+    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        if batch_size <= 0:
+            return None
+        self._samples_since_fetch += 1
+        try:
+            self._try_fetch()
+        except Exception:
+            pass
+        if not self._chunk_order:
+            return None
+        states = []
+        teacher_actions = []
+        student_actions = []
+        for _ in range(batch_size):
+            fn = random.choice(self._chunk_order)
+            chunk = self._chunks[fn]
+            chunk_len = chunk["states"].shape[0]
+            idx = np.random.randint(0, chunk_len)
+            states.append(chunk["states"][idx])
+            teacher_actions.append(chunk["teacher_actions"][idx])
+            student_actions.append(chunk["student_actions"][idx])
+        return np.stack(states, axis=0), np.stack(teacher_actions, axis=0), np.stack(student_actions, axis=0)
+
+    def loaded_size(self) -> int:
+        return self._size
