@@ -31,15 +31,18 @@ class PreferencePairStorage:
         *,
         obs_shape: Tuple[int, ...],
         action_shape: Tuple[int, ...],
+        prev_action_shape: Tuple[int, ...],
         storage_dir: Path,
         chunk_size: int = 64,
     ):
         self.obs_shape = tuple(obs_shape)
         self.action_shape = tuple(action_shape)
+        self.prev_action_shape = tuple(prev_action_shape)
         self.storage_dir = storage_dir
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.chunk_size = max(1, int(chunk_size))
         self._states: list[np.ndarray] = []
+        self._prev_actions: list[np.ndarray] = []
         self._teacher_actions: list[np.ndarray] = []
         self._student_actions: list[np.ndarray] = []
         self._num_chunks = 0
@@ -57,15 +60,22 @@ class PreferencePairStorage:
             self._num_chunks = max(self._num_chunks, idx + 1)
             self._num_pairs += count
 
-    def add(self, state: np.ndarray, teacher_action: np.ndarray, student_action: np.ndarray) -> None:
+    def add(self, state: np.ndarray, prev_actions: np.ndarray,
+            teacher_action: np.ndarray, student_action: np.ndarray) -> None:
         state_arr = np.asarray(state)
+        prev_arr = np.asarray(prev_actions, dtype=np.float32)
         teacher_arr = np.asarray(teacher_action, dtype=np.float32)
         student_arr = np.asarray(student_action, dtype=np.float32)
         if state_arr.shape != self.obs_shape:
             raise ValueError(f"Preference buffer state shape mismatch: expected {self.obs_shape}, got {state_arr.shape}")
+        if prev_arr.shape != self.prev_action_shape:
+            raise ValueError(
+                f"Preference buffer prev_action shape mismatch: expected {self.prev_action_shape}, got {prev_arr.shape}"
+            )
         if teacher_arr.shape != self.action_shape or student_arr.shape != self.action_shape:
             raise ValueError("Preference buffer action shape mismatch")
         self._states.append(state_arr.astype(np.uint8, copy=False))
+        self._prev_actions.append(prev_arr)
         self._teacher_actions.append(teacher_arr)
         self._student_actions.append(student_arr)
         if len(self._states) >= self.chunk_size:
@@ -76,6 +86,7 @@ class PreferencePairStorage:
             return
         chunk = {
             "states": np.stack(self._states, axis=0),
+            "prev_actions": np.stack(self._prev_actions, axis=0),
             "teacher_actions": np.stack(self._teacher_actions, axis=0),
             "student_actions": np.stack(self._student_actions, axis=0),
         }
@@ -86,6 +97,7 @@ class PreferencePairStorage:
         self._num_chunks += 1
         self._num_pairs += chunk_len
         self._states.clear()
+        self._prev_actions.clear()
         self._teacher_actions.clear()
         self._student_actions.clear()
 
@@ -105,6 +117,7 @@ class PreferencePairDataset:
         storage_dir: Path,
         max_size: int,
         fetch_every: int = 512,
+        prev_action_shape: Tuple[int, ...] | None = None,
     ):
         self.storage_dir = storage_dir
         self.storage_dir.mkdir(parents=True, exist_ok=True)
@@ -114,6 +127,7 @@ class PreferencePairDataset:
         self._chunks: Dict[Path, Dict[str, np.ndarray]] = {}
         self._chunk_order: list[Path] = []
         self._size = 0
+        self.prev_action_shape = tuple(prev_action_shape) if prev_action_shape else None
 
     def _try_fetch(self) -> None:
         if self._samples_since_fetch < self.fetch_every:
@@ -140,7 +154,7 @@ class PreferencePairDataset:
             self._chunk_order.append(fn)
             self._size += chunk["states"].shape[0]
 
-    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    def sample(self, batch_size: int) -> Tuple[np.ndarray, ...] | None:
         if batch_size <= 0:
             return None
         self._samples_since_fetch += 1
@@ -151,6 +165,7 @@ class PreferencePairDataset:
         if not self._chunk_order:
             return None
         states = []
+        prev_actions = [] if self.prev_action_shape is not None else None
         teacher_actions = []
         student_actions = []
         for _ in range(batch_size):
@@ -159,9 +174,21 @@ class PreferencePairDataset:
             chunk_len = chunk["states"].shape[0]
             idx = np.random.randint(0, chunk_len)
             states.append(chunk["states"][idx])
+            if prev_actions is not None:
+                if "prev_actions" in chunk:
+                    prev_actions.append(chunk["prev_actions"][idx])
+                else:
+                    prev_actions.append(np.zeros(self.prev_action_shape,
+                                                 dtype=np.float32))
             teacher_actions.append(chunk["teacher_actions"][idx])
             student_actions.append(chunk["student_actions"][idx])
-        return np.stack(states, axis=0), np.stack(teacher_actions, axis=0), np.stack(student_actions, axis=0)
+        states_arr = np.stack(states, axis=0)
+        teacher_arr = np.stack(teacher_actions, axis=0)
+        student_arr = np.stack(student_actions, axis=0)
+        if prev_actions is not None:
+            prev_arr = np.stack(prev_actions, axis=0)
+            return states_arr, prev_arr, teacher_arr, student_arr
+        return states_arr, teacher_arr, student_arr
 
     def loaded_size(self) -> int:
         return self._size

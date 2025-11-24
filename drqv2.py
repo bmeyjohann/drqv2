@@ -85,8 +85,12 @@ class Actor(nn.Module):
 
         self.apply(utils.weight_init)
 
-    def forward(self, obs, std):
-        h = self.trunk(obs)
+    def forward(self, obs, prev_actions, std):
+        if prev_actions is not None:
+            trunk_input = torch.cat([obs, prev_actions], dim=-1)
+        else:
+            trunk_input = obs
+        h = self.trunk(trunk_input)
 
         mu = self.policy(h)
         mu = torch.tanh(mu)
@@ -115,8 +119,12 @@ class Critic(nn.Module):
 
         self.apply(utils.weight_init)
 
-    def forward(self, obs, action):
-        h = self.trunk(obs)
+    def forward(self, obs, prev_actions, action):
+        if prev_actions is not None:
+            trunk_input = torch.cat([obs, prev_actions], dim=-1)
+        else:
+            trunk_input = obs
+        h = self.trunk(trunk_input)
         h_action = torch.cat([h, action], dim=-1)
         q1 = self.Q1(h_action)
         q2 = self.Q2(h_action)
@@ -127,7 +135,8 @@ class Critic(nn.Module):
 class DrQV2Agent:
     def __init__(self, obs_shape, action_shape, device, lr, feature_dim,
                  hidden_dim, critic_target_tau, num_expl_steps,
-                 update_every_steps, stddev_schedule, stddev_clip, use_tb):
+                 update_every_steps, stddev_schedule, stddev_clip, use_tb,
+                 action_history_len=0):
         self.device = device
         self.critic_target_tau = critic_target_tau
         self.update_every_steps = update_every_steps
@@ -135,15 +144,18 @@ class DrQV2Agent:
         self.num_expl_steps = num_expl_steps
         self.stddev_schedule = stddev_schedule
         self.stddev_clip = stddev_clip
+        self.action_dim = int(np.prod(action_shape))
+        self.action_history_len = max(0, int(action_history_len or 0))
+        self.prev_action_dim = self.action_dim * self.action_history_len
 
         # models
         self.encoder = Encoder(obs_shape).to(device)
-        self.actor = Actor(self.encoder.repr_dim, action_shape, feature_dim,
+        actor_input_dim = self.encoder.repr_dim + self.prev_action_dim
+        self.actor = Actor(actor_input_dim, action_shape, feature_dim,
                            hidden_dim).to(device)
-
-        self.critic = Critic(self.encoder.repr_dim, action_shape, feature_dim,
+        self.critic = Critic(actor_input_dim, action_shape, feature_dim,
                              hidden_dim).to(device)
-        self.critic_target = Critic(self.encoder.repr_dim, action_shape,
+        self.critic_target = Critic(actor_input_dim, action_shape,
                                     feature_dim, hidden_dim).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
@@ -164,11 +176,36 @@ class DrQV2Agent:
         self.actor.train(training)
         self.critic.train(training)
 
-    def act(self, obs, step, eval_mode):
+    def _format_prev_actions(self, prev_actions, batch_size):
+        if self.prev_action_dim == 0:
+            return None
+        if prev_actions is None:
+            return torch.zeros(batch_size,
+                               self.prev_action_dim,
+                               device=self.device)
+        tensor = torch.as_tensor(prev_actions,
+                                 device=self.device,
+                                 dtype=torch.float32)
+        if tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0)
+        return tensor
+
+    def _ensure_prev_tensor(self, prev_actions, batch_size):
+        if self.prev_action_dim == 0:
+            return None
+        if prev_actions is None:
+            return torch.zeros(batch_size,
+                               self.prev_action_dim,
+                               device=self.device)
+        return prev_actions
+
+    def act(self, obs, step, eval_mode=False, prev_actions=None):
         obs = torch.as_tensor(obs, device=self.device)
         obs = self.encoder(obs.unsqueeze(0))
+        prev_actions_tensor = self._format_prev_actions(prev_actions,
+                                                       obs.shape[0])
         stddev = utils.schedule(self.stddev_schedule, step)
-        dist = self.actor(obs, stddev)
+        dist = self.actor(obs, prev_actions_tensor, stddev)
         if eval_mode:
             action = dist.mean
         else:
@@ -180,10 +217,12 @@ class DrQV2Agent:
     def update_critic(
         self,
         obs,
+        prev_actions,
         action,
         reward,
         discount,
         next_obs,
+        next_prev_actions,
         step,
         pref_tensors=None,
         pref_weight: float = 0.0,
@@ -194,13 +233,15 @@ class DrQV2Agent:
 
         with torch.no_grad():
             stddev = utils.schedule(self.stddev_schedule, step)
-            dist = self.actor(next_obs, stddev)
+            dist = self.actor(next_obs, next_prev_actions, stddev)
             next_action = dist.sample(clip=self.stddev_clip)
-            target_Q1, target_Q2 = self.critic_target(next_obs, next_action)
+            target_Q1, target_Q2 = self.critic_target(next_obs,
+                                                     next_prev_actions,
+                                                     next_action)
             target_V = torch.min(target_Q1, target_Q2)
             target_Q = reward + (discount * target_V)
 
-        Q1, Q2 = self.critic(obs, action)
+        Q1, Q2 = self.critic(obs, prev_actions, action)
         critic_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
 
         pref_loss = None
@@ -208,11 +249,24 @@ class DrQV2Agent:
             pref_tensors is not None
             and pref_weight > 0.0
             and isinstance(pref_tensors, tuple)
-            and len(pref_tensors) == 3
+            and len(pref_tensors) >= 3
         ):
-            pref_obs, pref_teacher_actions, pref_student_actions = pref_tensors
-            teacher_q1, teacher_q2 = self.critic(pref_obs, pref_teacher_actions)
-            student_q1, student_q2 = self.critic(pref_obs, pref_student_actions)
+            if len(pref_tensors) == 4:
+                (pref_obs,
+                 pref_prev_actions,
+                 pref_teacher_actions,
+                 pref_student_actions) = pref_tensors
+            else:
+                (pref_obs,
+                 pref_teacher_actions,
+                 pref_student_actions) = pref_tensors
+                pref_prev_actions = None
+            teacher_q1, teacher_q2 = self.critic(pref_obs,
+                                                 pref_prev_actions,
+                                                 pref_teacher_actions)
+            student_q1, student_q2 = self.critic(pref_obs,
+                                                 pref_prev_actions,
+                                                 pref_student_actions)
             q_teacher = torch.min(teacher_q1, teacher_q2)
             q_student = torch.min(student_q1, student_q2)
             delta = q_teacher - q_student
@@ -224,14 +278,11 @@ class DrQV2Agent:
                 ).mean()
             critic_loss = critic_loss + float(pref_weight) * pref_loss
 
-        if self.use_tb:
-            metrics['critic_target_q'] = target_Q.mean().item()
-            metrics['critic_q1'] = Q1.mean().item()
-            metrics['critic_q2'] = Q2.mean().item()
-            metrics['critic_loss'] = critic_loss.item()
-            if pref_loss is not None:
-                metrics['pref_loss'] = pref_loss.item()
-        elif pref_loss is not None:
+        metrics['critic_target_q'] = target_Q.mean().item()
+        metrics['critic_q1'] = Q1.mean().item()
+        metrics['critic_q2'] = Q2.mean().item()
+        metrics['critic_loss'] = critic_loss.item()
+        if pref_loss is not None:
             metrics['pref_loss'] = pref_loss.item()
 
         # optimize encoder and critic
@@ -243,14 +294,14 @@ class DrQV2Agent:
 
         return metrics
 
-    def update_actor(self, obs, step):
+    def update_actor(self, obs, prev_actions, step):
         metrics = dict()
 
         stddev = utils.schedule(self.stddev_schedule, step)
-        dist = self.actor(obs, stddev)
+        dist = self.actor(obs, prev_actions, stddev)
         action = dist.sample(clip=self.stddev_clip)
         log_prob = dist.log_prob(action).sum(-1, keepdim=True)
-        Q1, Q2 = self.critic(obs, action)
+        Q1, Q2 = self.critic(obs, prev_actions, action)
         Q = torch.min(Q1, Q2)
 
         actor_loss = -Q.mean()
@@ -260,10 +311,9 @@ class DrQV2Agent:
         actor_loss.backward()
         self.actor_opt.step()
 
-        if self.use_tb:
-            metrics['actor_loss'] = actor_loss.item()
-            metrics['actor_logprob'] = log_prob.mean().item()
-            metrics['actor_ent'] = dist.entropy().sum(dim=-1).mean().item()
+        metrics['actor_loss'] = actor_loss.item()
+        metrics['actor_logprob'] = log_prob.mean().item()
+        metrics['actor_ent'] = dist.entropy().sum(dim=-1).mean().item()
 
         return metrics
 
@@ -282,12 +332,32 @@ class DrQV2Agent:
             return metrics
 
         batch = next(replay_iter)
-        obs, action, reward, discount, next_obs = utils.to_torch(
-            batch, self.device)
+        if len(batch) == 5:
+            obs, action, reward, discount, next_obs = utils.to_torch(
+                batch, self.device)
+            prev_actions = None
+            next_prev_actions = None
+        elif len(batch) == 7:
+            (obs,
+             prev_actions,
+             action,
+             reward,
+             discount,
+             next_obs,
+             next_prev_actions) = utils.to_torch(batch, self.device)
+        else:
+            raise ValueError(
+                f"Unexpected replay batch length {len(batch)}")
 
         # augment
         obs = self.aug(obs.float())
         next_obs = self.aug(next_obs.float())
+        if prev_actions is not None:
+            prev_actions = prev_actions.float()
+            next_prev_actions = next_prev_actions.float()
+        prev_actions = self._ensure_prev_tensor(prev_actions, obs.shape[0])
+        next_prev_actions = self._ensure_prev_tensor(next_prev_actions,
+                                                     next_obs.shape[0])
         # encode
         obs = self.encoder(obs)
         with torch.no_grad():
@@ -298,15 +368,24 @@ class DrQV2Agent:
             pref_batch is not None
             and pref_weight > 0.0
             and isinstance(pref_batch, tuple)
-            and len(pref_batch) == 3
+            and len(pref_batch) in (3, 4)
         ):
-            pref_obs_np, pref_teacher_np, pref_student_np = pref_batch
+            if len(pref_batch) == 4:
+                pref_obs_np, pref_prev_np, pref_teacher_np, pref_student_np = pref_batch
+                pref_prev = torch.as_tensor(pref_prev_np,
+                                            device=self.device).float()
+            else:
+                pref_obs_np, pref_teacher_np, pref_student_np = pref_batch
+                pref_prev = None
             pref_obs = torch.as_tensor(pref_obs_np, device=self.device).float()
             pref_teacher = torch.as_tensor(pref_teacher_np, device=self.device).float()
             pref_student = torch.as_tensor(pref_student_np, device=self.device).float()
             pref_obs = self.aug(pref_obs)
             pref_obs = self.encoder(pref_obs)
-            pref_tensors = (pref_obs, pref_teacher, pref_student)
+            if pref_prev is not None:
+                pref_prev = pref_prev.float()
+            pref_prev = self._ensure_prev_tensor(pref_prev, pref_obs.shape[0])
+            pref_tensors = (pref_obs, pref_prev, pref_teacher, pref_student)
 
         if self.use_tb:
             metrics['batch_reward'] = reward.mean().item()
@@ -315,10 +394,12 @@ class DrQV2Agent:
         metrics.update(
             self.update_critic(
                 obs,
+                prev_actions,
                 action,
                 reward,
                 discount,
                 next_obs,
+                next_prev_actions,
                 step,
                 pref_tensors,
                 pref_weight,
@@ -327,7 +408,8 @@ class DrQV2Agent:
             ))
 
         # update actor
-        metrics.update(self.update_actor(obs.detach(), step))
+        actor_prev_actions = prev_actions.detach() if prev_actions is not None else None
+        metrics.update(self.update_actor(obs.detach(), actor_prev_actions, step))
 
         # update critic target
         utils.soft_update_params(self.critic, self.critic_target,

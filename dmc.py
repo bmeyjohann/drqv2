@@ -18,6 +18,7 @@ class ExtendedTimeStep(NamedTuple):
     discount: Any
     observation: Any
     action: Any
+    prev_actions: Any
 
     def first(self):
         return self.step_type == StepType.FIRST
@@ -160,13 +161,16 @@ class ExtendedTimeStepWrapper(dm_env.Environment):
         time_step = self._env.step(action)
         return self._augment_time_step(time_step, action)
 
-    def _augment_time_step(self, time_step, action=None):
+    def _augment_time_step(self, time_step, action=None, prev_actions=None):
         if action is None:
             action_spec = self.action_spec()
             action = np.zeros(action_spec.shape, dtype=action_spec.dtype)
+        if prev_actions is None:
+            prev_actions = np.zeros_like(action)
         return ExtendedTimeStep(observation=time_step.observation,
                                 step_type=time_step.step_type,
                                 action=action,
+                                prev_actions=prev_actions,
                                 reward=time_step.reward or 0.0,
                                 discount=time_step.discount or 1.0)
 
