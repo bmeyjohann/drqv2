@@ -98,6 +98,9 @@ class ReplayBuffer(IterableDataset):
         self._fetch_every = fetch_every
         self._samples_since_last_fetch = fetch_every
         self._save_snapshot = save_snapshot
+        self._has_prev_actions = False
+        self._has_hidden_state = False
+        self._has_warp_params = False
 
     def _sample_episode(self):
         eps_fn = random.choice(self._episode_fns)
@@ -108,6 +111,12 @@ class ReplayBuffer(IterableDataset):
             episode = load_episode(eps_fn)
         except:
             return False
+        if not self._has_prev_actions:
+            self._has_prev_actions = 'prev_actions' in episode
+        if not self._has_hidden_state:
+            self._has_hidden_state = 'hidden_state' in episode
+        if not self._has_warp_params:
+            self._has_warp_params = 'warp_params' in episode
         eps_len = episode_len(episode)
         while eps_len + self._size > self._max_size:
             early_eps_fn = self._episode_fns.pop(0)
@@ -163,12 +172,27 @@ class ReplayBuffer(IterableDataset):
             step_reward = episode['reward'][idx + i]
             reward += discount * step_reward
             discount *= episode['discount'][idx + i] * self._discount
-        if 'prev_actions' in episode:
+        sample = [obs]
+        if self._has_prev_actions:
             prev_actions = episode['prev_actions'][idx - 1]
             next_prev_actions = episode['prev_actions'][idx + self._nstep - 1]
-            return (obs, prev_actions, action, reward, discount, next_obs,
-                    next_prev_actions)
-        return (obs, action, reward, discount, next_obs)
+            sample.append(prev_actions)
+        if self._has_hidden_state:
+            hidden_state = episode['hidden_state'][idx - 1]
+            next_hidden_state = episode['hidden_state'][idx + self._nstep - 1]
+            sample.append(hidden_state)
+        if self._has_warp_params:
+            warp_params = episode['warp_params'][idx - 1]
+            next_warp_params = episode['warp_params'][idx + self._nstep - 1]
+            sample.append(warp_params)
+        sample.extend([action, reward, discount, next_obs])
+        if self._has_prev_actions:
+            sample.append(next_prev_actions)
+        if self._has_hidden_state:
+            sample.append(next_hidden_state)
+        if self._has_warp_params:
+            sample.append(next_warp_params)
+        return tuple(sample)
 
     def __iter__(self):
         while True:
