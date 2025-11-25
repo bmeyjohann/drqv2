@@ -410,10 +410,12 @@ class DrQV2RecurrentAgent:
         self.critic_opt.step()
         self.encoder_opt.step()
 
+        actor_obs = flat.detach()
+        actor_prev_actions = prev_actions.detach() if prev_actions is not None else None
         stddev = utils.schedule(self.stddev_schedule, step)
-        dist = self.actor(flat, prev_actions, stddev)
+        dist = self.actor(actor_obs, actor_prev_actions, stddev)
         new_action = dist.sample(clip=self.stddev_clip)
-        actor_q1, actor_q2 = self.critic(flat, prev_actions, new_action)
+        actor_q1, actor_q2 = self.critic(actor_obs, actor_prev_actions, new_action)
         actor_loss = -torch.min(actor_q1, actor_q2).mean()
         log_prob = dist.log_prob(new_action).sum(-1, keepdim=True)
 
