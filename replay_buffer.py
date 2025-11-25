@@ -199,6 +199,105 @@ class ReplayBuffer(IterableDataset):
             yield self._sample()
 
 
+class SequenceReplayBuffer(IterableDataset):
+    def __init__(self, replay_dir, max_size, num_workers,
+                 fetch_every, save_snapshot, sequence_length, burn_in):
+        self._replay_dir = replay_dir
+        self._size = 0
+        self._max_size = max_size
+        self._num_workers = max(1, num_workers)
+        self._episode_fns = []
+        self._episodes = dict()
+        self._fetch_every = fetch_every
+        self._samples_since_last_fetch = fetch_every
+        self._save_snapshot = save_snapshot
+        self._has_prev_actions = False
+        self._sequence_length = int(sequence_length)
+        self._burn_in = int(burn_in)
+
+    def _store_episode(self, eps_fn):
+        try:
+            episode = load_episode(eps_fn)
+        except Exception:
+            return False
+        if not self._has_prev_actions:
+            self._has_prev_actions = 'prev_actions' in episode
+        eps_len = episode_len(episode)
+        while eps_len + self._size > self._max_size:
+            early_eps_fn = self._episode_fns.pop(0)
+            early_eps = self._episodes.pop(early_eps_fn)
+            self._size -= episode_len(early_eps)
+            early_eps_fn.unlink(missing_ok=True)
+        self._episode_fns.append(eps_fn)
+        self._episode_fns.sort()
+        self._episodes[eps_fn] = episode
+        self._size += eps_len
+        if not self._save_snapshot:
+            eps_fn.unlink(missing_ok=True)
+        return True
+
+    def _try_fetch(self):
+        if self._samples_since_last_fetch < self._fetch_every:
+            return
+        self._samples_since_last_fetch = 0
+        try:
+            worker_id = torch.utils.data.get_worker_info().id
+        except Exception:
+            worker_id = 0
+        eps_fns = sorted(self._replay_dir.glob('*.npz'), reverse=True)
+        fetched_size = 0
+        for eps_fn in eps_fns:
+            try:
+                eps_idx, eps_len = [int(x) for x in eps_fn.stem.split('_')[1:]]
+            except Exception:
+                continue
+            if eps_idx % self._num_workers != worker_id:
+                continue
+            if eps_fn in self._episodes.keys():
+                break
+            if fetched_size + eps_len > self._max_size:
+                break
+            fetched_size += eps_len
+            if not self._store_episode(eps_fn):
+                break
+
+    def _sample_episode(self):
+        eps_fn = random.choice(self._episode_fns)
+        return self._episodes[eps_fn]
+
+    def _sample(self):
+        try:
+            self._try_fetch()
+        except Exception:
+            traceback.print_exc()
+        self._samples_since_last_fetch += 1
+        episode = self._sample_episode()
+        eps_len = episode_len(episode)  # transitions
+        window = self._sequence_length + self._burn_in
+        if eps_len <= window:
+            return self._sample()  # resample
+        start = np.random.randint(0, eps_len - window + 1)
+        end = start + window
+        obs_seq = episode['observation'][start:end + 1]  # +1 for bootstrap
+        action_seq = episode['action'][start + 1:end + 1]
+        reward_seq = episode['reward'][start + 1:end + 1]
+        discount_seq = episode['discount'][start + 1:end + 1]
+        sample = [obs_seq.astype(np.float32)]
+        if self._has_prev_actions:
+            prev_seq = episode['prev_actions'][start:end]
+            sample.append(prev_seq.astype(np.float32))
+        sample.extend([
+            action_seq.astype(np.float32),
+            reward_seq.astype(np.float32),
+            discount_seq.astype(np.float32),
+        ])
+        return tuple(sample)
+
+    def __iter__(self):
+        while True:
+            yield self._sample()
+
+
 def _worker_init_fn(worker_id):
     seed = int(np.random.get_state()[1][0]) + int(worker_id)
     np.random.seed(seed)
@@ -217,6 +316,24 @@ def make_replay_loader(replay_dir, max_size, batch_size, num_workers,
                             fetch_every=1000,
                             save_snapshot=save_snapshot)
 
+    loader = torch.utils.data.DataLoader(iterable,
+                                         batch_size=batch_size,
+                                         num_workers=num_workers,
+                                         pin_memory=True,
+                                         worker_init_fn=_worker_init_fn)
+    return loader
+
+
+def make_sequence_replay_loader(replay_dir, max_size, batch_size, num_workers,
+                                save_snapshot, sequence_length, burn_in):
+    max_size_per_worker = max_size // max(1, num_workers)
+    iterable = SequenceReplayBuffer(replay_dir,
+                                    max_size_per_worker,
+                                    num_workers,
+                                    fetch_every=1000,
+                                    save_snapshot=save_snapshot,
+                                    sequence_length=sequence_length,
+                                    burn_in=burn_in)
     loader = torch.utils.data.DataLoader(iterable,
                                          batch_size=batch_size,
                                          num_workers=num_workers,

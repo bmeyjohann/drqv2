@@ -175,6 +175,8 @@ class DrQV2RecurrentAgent:
         recurrent_hidden_dim: int,
         conv_hidden_channels: int,
         use_se2_warp: bool,
+        unroll_length: int = 8,
+        burn_in: int = 0,
     ):
         self.device = device
         self.critic_target_tau = critic_target_tau
@@ -200,6 +202,8 @@ class DrQV2RecurrentAgent:
             self.core.encoder.out_hw,
         )
         self.warp_dim = 3 if self.use_se2_warp else 0
+        self.unroll_length = int(unroll_length)
+        self.burn_in = int(burn_in)
 
         repr_dim = int(np.prod(self.hidden_state_shape))
         actor_input_dim = repr_dim + self.prev_action_dim
@@ -317,6 +321,22 @@ class DrQV2RecurrentAgent:
         new_hidden, flat = self.core(obs_tensor, hidden_tensor, warp_params=warp_tensor, augment=augment)
         return new_hidden, flat
 
+    def _compute_warp_sequence(self, actions: torch.Tensor) -> torch.Tensor:
+        if not self.use_se2_warp:
+            B, T, _ = actions.shape
+            return torch.zeros(B, T + 1, 3, device=actions.device, dtype=actions.dtype)
+        B, T, _ = actions.shape
+        warp_seq = torch.zeros(B, T + 1, 3, device=actions.device, dtype=actions.dtype)
+        dx = actions[..., 0]
+        dy = actions[..., 1]
+        warp_seq[:, 1:, 0] = dx
+        warp_seq[:, 1:, 1] = dy
+        ang_prev = torch.atan2(dy.roll(1, dims=1), dx.roll(1, dims=1))
+        ang_now = torch.atan2(dy, dx)
+        ang_prev[:, 0] = ang_now[:, 0]
+        warp_seq[:, 1:, 2] = ang_now - ang_prev
+        return warp_seq
+
     def update(self,
                replay_iter,
                step,
@@ -327,82 +347,58 @@ class DrQV2RecurrentAgent:
         metrics = {}
         if step % self.update_every_steps != 0:
             return metrics
+
         batch = next(replay_iter)
         batch_iter = iter(batch)
-        obs = next(batch_iter)
-        prev_actions_np = next(batch_iter) if self.prev_action_dim > 0 else None
-        hidden_state = next(batch_iter)
-        warp_params = next(batch_iter) if self.use_se2_warp else None
-        action = next(batch_iter)
-        reward = next(batch_iter)
-        discount = next(batch_iter)
-        next_obs = next(batch_iter)
-        next_prev_actions_np = next(batch_iter) if self.prev_action_dim > 0 else None
-        next_hidden_state = next(batch_iter)
-        next_warp_params = next(batch_iter) if self.use_se2_warp else None
+        obs_seq = torch.as_tensor(next(batch_iter), device=self.device).float()
+        prev_seq = None
+        if self.prev_action_dim > 0:
+            prev_seq = torch.as_tensor(next(batch_iter), device=self.device).float()
+        action_seq = torch.as_tensor(next(batch_iter), device=self.device).float()
+        reward_seq = torch.as_tensor(next(batch_iter), device=self.device).float()
+        discount_seq = torch.as_tensor(next(batch_iter), device=self.device).float()
 
-        obs = torch.as_tensor(obs, device=self.device).float()
-        next_obs = torch.as_tensor(next_obs, device=self.device).float()
-        reward = torch.as_tensor(reward, device=self.device).float()
-        discount = torch.as_tensor(discount, device=self.device).float()
-        action = torch.as_tensor(action, device=self.device).float()
-        prev_actions = torch.as_tensor(prev_actions_np, device=self.device).float() if prev_actions_np is not None else None
-        next_prev_actions = torch.as_tensor(next_prev_actions_np, device=self.device).float() if next_prev_actions_np is not None else None
-        hidden_tensor = torch.as_tensor(hidden_state, device=self.device).float()
-        next_hidden_tensor = torch.as_tensor(next_hidden_state, device=self.device).float()
-        warp_tensor = torch.as_tensor(warp_params, device=self.device).float() if self.use_se2_warp else None
-        next_warp_tensor = torch.as_tensor(next_warp_params, device=self.device).float() if self.use_se2_warp else None
+        B, Tp1, _, _, _ = obs_seq.shape
+        total_steps = Tp1 - 1
+        burn_in = min(self.burn_in, total_steps - 1)
 
-        _, feats = self._compute_representation(obs, hidden_tensor, warp_tensor, augment=True)
-        flat = feats.view(feats.shape[0], -1)
+        init_hidden = self.core.init_hidden(B, self.device)
+        warp_seq = self._compute_warp_sequence(action_seq) if self.use_se2_warp else None
 
-        _, next_feats = self._compute_representation(next_obs, next_hidden_tensor, next_warp_tensor, augment=True)
-        next_flat = next_feats.view(next_feats.shape[0], -1)
+        feats_list = []
+        h = init_hidden
+        for t in range(Tp1):
+            warp_t = warp_seq[:, t] if warp_seq is not None else None
+            h, flat = self.core(obs_seq[:, t], h, warp_params=warp_t, augment=True)
+            feats_list.append(flat)
+        feats = torch.stack(feats_list, dim=1)
+        repr_dim = feats.shape[-1]
+
+        start_idx = burn_in
+        end_idx = total_steps
+        z_t = feats[:, start_idx:end_idx].reshape(-1, repr_dim)
+        z_tp1 = feats[:, start_idx + 1:end_idx + 1].reshape(-1, repr_dim)
+        a_t = action_seq[:, start_idx:end_idx].reshape(-1, action_seq.shape[-1])
+        r_t = reward_seq[:, start_idx:end_idx].reshape(-1, 1)
+        disc_t = discount_seq[:, start_idx:end_idx].reshape(-1, 1)
+
+        if self.prev_action_dim > 0 and prev_seq is not None:
+            prev_t = prev_seq[:, start_idx:end_idx].reshape(-1, self.prev_action_dim)
+            next_prev = prev_seq[:, start_idx + 1:end_idx + 1].reshape(-1, self.prev_action_dim)
+        else:
+            prev_t = None
+            next_prev = None
 
         with torch.no_grad():
             stddev = utils.schedule(self.stddev_schedule, step)
-            dist = self.actor(next_flat, next_prev_actions, stddev)
-            next_action = dist.sample(clip=self.stddev_clip)
-            target_q1, target_q2 = self.critic_target(next_flat, next_prev_actions, next_action)
+            dist_next = self.actor(z_tp1, next_prev, stddev)
+            a_tp1 = dist_next.sample(clip=self.stddev_clip)
+            target_q1, target_q2 = self.critic_target(z_tp1, next_prev, a_tp1)
             target_V = torch.min(target_q1, target_q2)
-            target_q = reward + discount * target_V
+            target_q = r_t + disc_t * target_V
 
-        current_q1, current_q2 = self.critic(flat, prev_actions, action)
+        current_q1, current_q2 = self.critic(z_t, prev_t, a_t)
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
-
-        pref_loss = None
-        if (
-            pref_batch is not None
-            and pref_weight > 0.0
-            and isinstance(pref_batch, tuple)
-        ):
-            pref_iter = iter(pref_batch)
-            pref_obs_np = next(pref_iter)
-            pref_prev_np = next(pref_iter) if self.prev_action_dim > 0 else None
-            pref_hidden_np = next(pref_iter) if self.hidden_state_shape is not None else None
-            pref_warp_np = next(pref_iter) if self.use_se2_warp else None
-            pref_teacher_np = next(pref_iter)
-            pref_student_np = next(pref_iter)
-            pref_obs = torch.as_tensor(pref_obs_np, device=self.device).float()
-            pref_prev = torch.as_tensor(pref_prev_np, device=self.device).float() if pref_prev_np is not None else None
-            pref_hidden = torch.as_tensor(pref_hidden_np, device=self.device).float() if pref_hidden_np is not None else None
-            pref_warp = torch.as_tensor(pref_warp_np, device=self.device).float() if self.use_se2_warp else None
-            pref_teacher = torch.as_tensor(pref_teacher_np, device=self.device).float()
-            pref_student = torch.as_tensor(pref_student_np, device=self.device).float()
-            _, pref_feats = self._compute_representation(pref_obs, pref_hidden, pref_warp, augment=True)
-            pref_flat = pref_feats.view(pref_feats.shape[0], -1)
-            teacher_q1, teacher_q2 = self.critic(pref_flat, pref_prev, pref_teacher)
-            student_q1, student_q2 = self.critic(pref_flat, pref_prev, pref_student)
-            teacher_q = torch.min(teacher_q1, teacher_q2)
-            student_q = torch.min(student_q1, student_q2)
-            delta = teacher_q - student_q
-            if pref_loss_type == "bradley_terry":
-                pref_loss = F.softplus(-delta).mean()
-            else:
-                pref_loss = F.softplus(
-                    torch.as_tensor(pref_margin, device=delta.device, dtype=delta.dtype) - delta
-                ).mean()
-            critic_loss = critic_loss + float(pref_weight) * pref_loss
 
         self.encoder_opt.zero_grad(set_to_none=True)
         self.critic_opt.zero_grad(set_to_none=True)
@@ -410,12 +406,12 @@ class DrQV2RecurrentAgent:
         self.critic_opt.step()
         self.encoder_opt.step()
 
-        actor_obs = flat.detach()
-        actor_prev_actions = prev_actions.detach() if prev_actions is not None else None
         stddev = utils.schedule(self.stddev_schedule, step)
-        dist = self.actor(actor_obs, actor_prev_actions, stddev)
+        z_detach = z_t.detach()
+        prev_detach = prev_t.detach() if prev_t is not None else None
+        dist = self.actor(z_detach, prev_detach, stddev)
         new_action = dist.sample(clip=self.stddev_clip)
-        actor_q1, actor_q2 = self.critic(actor_obs, actor_prev_actions, new_action)
+        actor_q1, actor_q2 = self.critic(z_detach, prev_detach, new_action)
         actor_loss = -torch.min(actor_q1, actor_q2).mean()
         log_prob = dist.log_prob(new_action).sum(-1, keepdim=True)
 
@@ -432,6 +428,4 @@ class DrQV2RecurrentAgent:
         metrics['actor_loss'] = actor_loss.item()
         metrics['actor_logprob'] = log_prob.mean().item()
         metrics['actor_ent'] = dist.entropy().sum(dim=-1).mean().item()
-        if pref_loss is not None:
-            metrics['pref_loss'] = pref_loss.item()
         return metrics
