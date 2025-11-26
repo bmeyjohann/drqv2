@@ -52,7 +52,7 @@ class ConvGRUCell(nn.Module):
         self.out_gate = nn.Conv2d(input_dim + hidden_dim, hidden_dim, kernel_size, padding=padding)
 
     def forward(self, x, h):
-        if h is None:
+        if h is None or h.dim() == 0:
             size_h = [x.size(0), self.reset_gate.out_channels, x.size(2), x.size(3)]
             h = torch.zeros(size_h, device=x.device, dtype=x.dtype)
         combined = torch.cat([x, h], dim=1)
