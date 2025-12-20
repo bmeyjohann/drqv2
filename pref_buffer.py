@@ -32,6 +32,7 @@ class PreferencePairStorage:
         obs_shape: Tuple[int, ...],
         action_shape: Tuple[int, ...],
         prev_action_shape: Tuple[int, ...],
+        goal_history_shape: Tuple[int, ...] | None = None,
         storage_dir: Path,
         chunk_size: int = 64,
         hidden_state_shape: Tuple[int, ...] | None = None,
@@ -40,6 +41,7 @@ class PreferencePairStorage:
         self.obs_shape = tuple(obs_shape)
         self.action_shape = tuple(action_shape)
         self.prev_action_shape = tuple(prev_action_shape)
+        self.goal_history_shape = tuple(goal_history_shape) if goal_history_shape else None
         self.hidden_state_shape = tuple(hidden_state_shape) if hidden_state_shape else None
         self.warp_param_dim = int(max(0, warp_param_dim))
         self.storage_dir = storage_dir
@@ -47,6 +49,7 @@ class PreferencePairStorage:
         self.chunk_size = max(1, int(chunk_size))
         self._states: list[np.ndarray] = []
         self._prev_actions: list[np.ndarray] = []
+        self._goal_histories: list[np.ndarray] = []
         self._hidden_states: list[np.ndarray] = []
         self._warp_params: list[np.ndarray] = []
         self._teacher_actions: list[np.ndarray] = []
@@ -69,12 +72,14 @@ class PreferencePairStorage:
     def add(self,
             state: np.ndarray,
             prev_actions: np.ndarray,
+            goal_history: np.ndarray | None,
             teacher_action: np.ndarray,
             student_action: np.ndarray,
             hidden_state: np.ndarray | None = None,
             warp_params: np.ndarray | None = None) -> None:
         state_arr = np.asarray(state)
         prev_arr = np.asarray(prev_actions, dtype=np.float32)
+        goal_arr = None if goal_history is None else np.asarray(goal_history, dtype=np.float32)
         teacher_arr = np.asarray(teacher_action, dtype=np.float32)
         student_arr = np.asarray(student_action, dtype=np.float32)
         if state_arr.shape != self.obs_shape:
@@ -83,6 +88,13 @@ class PreferencePairStorage:
             raise ValueError(
                 f"Preference buffer prev_action shape mismatch: expected {self.prev_action_shape}, got {prev_arr.shape}"
             )
+        if self.goal_history_shape is not None:
+            if goal_arr is None:
+                raise ValueError("Preference buffer requires goal_history but none provided")
+            if goal_arr.shape != self.goal_history_shape:
+                raise ValueError(
+                    f"Preference buffer goal_history shape mismatch: expected {self.goal_history_shape}, got {goal_arr.shape}"
+                )
         if teacher_arr.shape != self.action_shape or student_arr.shape != self.action_shape:
             raise ValueError("Preference buffer action shape mismatch")
         if self.hidden_state_shape is not None:
@@ -107,6 +119,8 @@ class PreferencePairStorage:
             warp_arr = None
         self._states.append(state_arr.astype(np.uint8, copy=False))
         self._prev_actions.append(prev_arr)
+        if self.goal_history_shape is not None:
+            self._goal_histories.append(goal_arr)
         if hidden_arr is not None:
             self._hidden_states.append(hidden_arr)
         if warp_arr is not None:
@@ -125,6 +139,8 @@ class PreferencePairStorage:
             "teacher_actions": np.stack(self._teacher_actions, axis=0),
             "student_actions": np.stack(self._student_actions, axis=0),
         }
+        if self._goal_histories:
+            chunk["goal_history"] = np.stack(self._goal_histories, axis=0)
         if self._hidden_states:
             chunk["hidden_states"] = np.stack(self._hidden_states, axis=0)
         if self._warp_params:
@@ -137,6 +153,7 @@ class PreferencePairStorage:
         self._num_pairs += chunk_len
         self._states.clear()
         self._prev_actions.clear()
+        self._goal_histories.clear()
         self._hidden_states.clear()
         self._warp_params.clear()
         self._teacher_actions.clear()
@@ -159,6 +176,7 @@ class PreferencePairDataset:
         max_size: int,
         fetch_every: int = 512,
         prev_action_shape: Tuple[int, ...] | None = None,
+        goal_history_shape: Tuple[int, ...] | None = None,
         hidden_state_shape: Tuple[int, ...] | None = None,
         warp_param_dim: int = 0,
     ):
@@ -171,6 +189,7 @@ class PreferencePairDataset:
         self._chunk_order: list[Path] = []
         self._size = 0
         self.prev_action_shape = tuple(prev_action_shape) if prev_action_shape else None
+        self.goal_history_shape = tuple(goal_history_shape) if goal_history_shape else None
         self.hidden_state_shape = tuple(hidden_state_shape) if hidden_state_shape else None
         self.warp_param_dim = int(max(0, warp_param_dim))
 
@@ -211,6 +230,7 @@ class PreferencePairDataset:
             return None
         states = []
         prev_actions = [] if self.prev_action_shape is not None else None
+        goal_histories = [] if self.goal_history_shape is not None else None
         hidden_states = [] if self.hidden_state_shape is not None else None
         warp_params = [] if self.warp_param_dim > 0 else None
         teacher_actions = []
@@ -227,6 +247,12 @@ class PreferencePairDataset:
                 else:
                     prev_actions.append(np.zeros(self.prev_action_shape,
                                                  dtype=np.float32))
+            if goal_histories is not None:
+                if "goal_history" in chunk:
+                    goal_histories.append(chunk["goal_history"][idx])
+                else:
+                    goal_histories.append(np.zeros(self.goal_history_shape,
+                                                   dtype=np.float32))
             if hidden_states is not None:
                 if "hidden_states" in chunk:
                     hidden_states.append(chunk["hidden_states"][idx])
@@ -248,6 +274,9 @@ class PreferencePairDataset:
             extras = [states_arr, prev_arr]
         else:
             extras = [states_arr]
+        if goal_histories is not None:
+            goal_arr = np.stack(goal_histories, axis=0)
+            extras.append(goal_arr)
         if hidden_states is not None:
             hidden_arr = np.stack(hidden_states, axis=0)
             extras.append(hidden_arr)

@@ -19,6 +19,7 @@ class ExtendedTimeStep(NamedTuple):
     observation: Any
     action: Any
     prev_actions: Any
+    goal_history: Any
     hidden_state: Any
     warp_params: Any
 
@@ -163,12 +164,14 @@ class ExtendedTimeStepWrapper(dm_env.Environment):
         time_step = self._env.step(action)
         return self._augment_time_step(time_step, action)
 
-    def _augment_time_step(self, time_step, action=None, prev_actions=None, hidden_state=None, warp_params=None):
+    def _augment_time_step(self, time_step, action=None, prev_actions=None, goal_history=None, hidden_state=None, warp_params=None):
         if action is None:
             action_spec = self.action_spec()
             action = np.zeros(action_spec.shape, dtype=action_spec.dtype)
         if prev_actions is None:
             prev_actions = np.zeros_like(action)
+        if goal_history is None:
+            goal_history = 0.0
         if hidden_state is None:
             hidden_state = 0.0
         if warp_params is None:
@@ -177,6 +180,7 @@ class ExtendedTimeStepWrapper(dm_env.Environment):
                                 step_type=time_step.step_type,
                                 action=action,
                                 prev_actions=prev_actions,
+                                goal_history=goal_history,
                                 hidden_state=hidden_state,
                                 warp_params=warp_params,
                                 reward=time_step.reward or 0.0,

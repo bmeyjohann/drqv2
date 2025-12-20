@@ -99,6 +99,7 @@ class ReplayBuffer(IterableDataset):
         self._samples_since_last_fetch = fetch_every
         self._save_snapshot = save_snapshot
         self._has_prev_actions = False
+        self._has_goal_history = False
         self._has_hidden_state = False
         self._has_warp_params = False
 
@@ -113,6 +114,8 @@ class ReplayBuffer(IterableDataset):
             return False
         if not self._has_prev_actions:
             self._has_prev_actions = 'prev_actions' in episode
+        if not self._has_goal_history:
+            self._has_goal_history = 'goal_history' in episode
         if not self._has_hidden_state:
             self._has_hidden_state = 'hidden_state' in episode
         if not self._has_warp_params:
@@ -177,6 +180,10 @@ class ReplayBuffer(IterableDataset):
             prev_actions = episode['prev_actions'][idx - 1]
             next_prev_actions = episode['prev_actions'][idx + self._nstep - 1]
             sample.append(prev_actions)
+        if self._has_goal_history:
+            goal_history = episode['goal_history'][idx - 1]
+            next_goal_history = episode['goal_history'][idx + self._nstep - 1]
+            sample.append(goal_history)
         if self._has_hidden_state:
             hidden_state = episode['hidden_state'][idx - 1]
             next_hidden_state = episode['hidden_state'][idx + self._nstep - 1]
@@ -188,6 +195,8 @@ class ReplayBuffer(IterableDataset):
         sample.extend([action, reward, discount, next_obs])
         if self._has_prev_actions:
             sample.append(next_prev_actions)
+        if self._has_goal_history:
+            sample.append(next_goal_history)
         if self._has_hidden_state:
             sample.append(next_hidden_state)
         if self._has_warp_params:
@@ -212,6 +221,7 @@ class SequenceReplayBuffer(IterableDataset):
         self._samples_since_last_fetch = fetch_every
         self._save_snapshot = save_snapshot
         self._has_prev_actions = False
+        self._has_goal_history = False
         self._sequence_length = int(sequence_length)
         self._burn_in = int(burn_in)
 
@@ -222,6 +232,8 @@ class SequenceReplayBuffer(IterableDataset):
             return False
         if not self._has_prev_actions:
             self._has_prev_actions = 'prev_actions' in episode
+        if not self._has_goal_history:
+            self._has_goal_history = 'goal_history' in episode
         eps_len = episode_len(episode)
         while eps_len + self._size > self._max_size:
             early_eps_fn = self._episode_fns.pop(0)
@@ -286,6 +298,9 @@ class SequenceReplayBuffer(IterableDataset):
         if self._has_prev_actions:
             prev_seq = episode['prev_actions'][start:end]
             sample.append(prev_seq.astype(np.float32))
+        if self._has_goal_history:
+            goal_seq = episode['goal_history'][start:end]
+            sample.append(goal_seq.astype(np.float32))
         sample.extend([
             action_seq.astype(np.float32),
             reward_seq.astype(np.float32),

@@ -177,6 +177,10 @@ class DrQV2RecurrentAgent:
         use_se2_warp: bool,
         unroll_length: int = 8,
         burn_in: int = 0,
+        goal_history_dim: int = 0,
+        use_context_mlp: bool = False,
+        context_hidden_dim: int = 128,
+        context_dim: int = 64,
     ):
         self.device = device
         self.critic_target_tau = critic_target_tau
@@ -186,6 +190,10 @@ class DrQV2RecurrentAgent:
         self.stddev_schedule = stddev_schedule
         self.stddev_clip = stddev_clip
         self.prev_action_dim = int(np.prod(action_shape)) * max(0, int(action_history_len or 0))
+        self.goal_history_dim = max(0, int(goal_history_dim or 0))
+        self.context_input_dim = self.prev_action_dim + self.goal_history_dim
+        self.use_context_mlp = bool(use_context_mlp) and self.context_input_dim > 0
+        self.context_dim = int(context_dim) if self.use_context_mlp else self.context_input_dim
 
         self.core = RecurrentFeatureExtractor(
             obs_shape,
@@ -206,7 +214,16 @@ class DrQV2RecurrentAgent:
         self.burn_in = int(burn_in)
 
         repr_dim = int(np.prod(self.hidden_state_shape))
-        actor_input_dim = repr_dim + self.prev_action_dim
+        if self.use_context_mlp:
+            self.context_mlp = nn.Sequential(
+                nn.Linear(self.context_input_dim, int(context_hidden_dim)),
+                nn.ReLU(inplace=True),
+                nn.Linear(int(context_hidden_dim), self.context_dim),
+                nn.ReLU(inplace=True),
+            ).to(device)
+        else:
+            self.context_mlp = None
+        actor_input_dim = repr_dim + self.context_dim
 
         self.actor = FeedforwardActor(actor_input_dim, action_shape, feature_dim, hidden_dim).to(device)
         self.critic = FeedforwardCritic(actor_input_dim, action_shape, feature_dim, hidden_dim).to(device)
@@ -216,6 +233,9 @@ class DrQV2RecurrentAgent:
         self.encoder_opt = torch.optim.Adam(self.core.parameters(), lr=lr)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
+        self.context_opt = None
+        if self.context_mlp is not None:
+            self.context_opt = torch.optim.Adam(self.context_mlp.parameters(), lr=lr)
 
         self.hidden_state = None
         self.cached_feature = None
@@ -270,9 +290,36 @@ class DrQV2RecurrentAgent:
             tensor = tensor.unsqueeze(0)
         return tensor
 
-    def prepare_observation(self, obs, prev_actions):
+    def _format_goal_history(self, goal_history, batch_size):
+        if self.goal_history_dim == 0:
+            return None
+        if goal_history is None:
+            return torch.zeros(batch_size, self.goal_history_dim, device=self.device)
+        tensor = torch.as_tensor(goal_history, device=self.device, dtype=torch.float32)
+        if tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0)
+        return tensor
+
+    def _build_context(self, prev_actions, goal_history, batch_size):
+        if self.context_input_dim == 0:
+            return None
+        prev_tensor = self._format_prev_actions(prev_actions, batch_size)
+        goal_tensor = self._format_goal_history(goal_history, batch_size)
+        if prev_tensor is None and goal_tensor is None:
+            return None
+        if prev_tensor is None:
+            context_in = goal_tensor
+        elif goal_tensor is None:
+            context_in = prev_tensor
+        else:
+            context_in = torch.cat([prev_tensor, goal_tensor], dim=-1)
+        if self.context_mlp is not None:
+            return self.context_mlp(context_in)
+        return context_in
+
+    def prepare_observation(self, obs, prev_actions, goal_history):
         obs_tensor = torch.as_tensor(obs, device=self.device).unsqueeze(0)
-        prev_act_tensor = self._format_prev_actions(prev_actions, obs_tensor.shape[0])
+        context_tensor = self._build_context(prev_actions, goal_history, obs_tensor.shape[0])
         if self.hidden_state is None:
             self.hidden_state = self.core.init_hidden(obs_tensor.shape[0], self.device)
         warp = None
@@ -281,12 +328,12 @@ class DrQV2RecurrentAgent:
         new_hidden, flat = self.core(obs_tensor, self.hidden_state, warp_params=warp, augment=False)
         self.hidden_state = new_hidden.detach()
         self.cached_feature = flat.detach()
-        self.cached_prev_actions = prev_act_tensor
+        self.cached_prev_actions = context_tensor
         if self.use_se2_warp:
             self.pending_warp = np.zeros_like(self.pending_warp)
 
-    def act(self, obs, step, eval_mode=False, prev_actions=None):
-        self.prepare_observation(obs, prev_actions)
+    def act(self, obs, step, eval_mode=False, prev_actions=None, goal_history=None):
+        self.prepare_observation(obs, prev_actions, goal_history)
         stddev = utils.schedule(self.stddev_schedule, step)
         dist = self.actor(self.cached_feature, self.cached_prev_actions, stddev)
         if eval_mode:
@@ -354,6 +401,9 @@ class DrQV2RecurrentAgent:
         prev_seq = None
         if self.prev_action_dim > 0:
             prev_seq = torch.as_tensor(next(batch_iter), device=self.device).float()
+        goal_seq = None
+        if self.goal_history_dim > 0:
+            goal_seq = torch.as_tensor(next(batch_iter), device=self.device).float()
         action_seq = torch.as_tensor(next(batch_iter), device=self.device).float()
         reward_seq = torch.as_tensor(next(batch_iter), device=self.device).float()
         discount_seq = torch.as_tensor(next(batch_iter), device=self.device).float()
@@ -388,30 +438,43 @@ class DrQV2RecurrentAgent:
         else:
             prev_t = None
             next_prev = None
+        if self.goal_history_dim > 0 and goal_seq is not None:
+            goal_t = goal_seq[:, start_idx:end_idx].reshape(-1, self.goal_history_dim)
+            next_goal = goal_seq[:, start_idx + 1:end_idx + 1].reshape(-1, self.goal_history_dim)
+        else:
+            goal_t = None
+            next_goal = None
+
+        context_t = self._build_context(prev_t, goal_t, z_t.shape[0])
+        next_context = self._build_context(next_prev, next_goal, z_tp1.shape[0])
 
         with torch.no_grad():
             stddev = utils.schedule(self.stddev_schedule, step)
-            dist_next = self.actor(z_tp1, next_prev, stddev)
+            dist_next = self.actor(z_tp1, next_context, stddev)
             a_tp1 = dist_next.sample(clip=self.stddev_clip)
-            target_q1, target_q2 = self.critic_target(z_tp1, next_prev, a_tp1)
+            target_q1, target_q2 = self.critic_target(z_tp1, next_context, a_tp1)
             target_V = torch.min(target_q1, target_q2)
             target_q = r_t + disc_t * target_V
 
-        current_q1, current_q2 = self.critic(z_t, prev_t, a_t)
+        current_q1, current_q2 = self.critic(z_t, context_t, a_t)
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
 
         self.encoder_opt.zero_grad(set_to_none=True)
         self.critic_opt.zero_grad(set_to_none=True)
+        if self.context_opt is not None:
+            self.context_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
         self.critic_opt.step()
         self.encoder_opt.step()
+        if self.context_opt is not None:
+            self.context_opt.step()
 
         stddev = utils.schedule(self.stddev_schedule, step)
         z_detach = z_t.detach()
-        prev_detach = prev_t.detach() if prev_t is not None else None
-        dist = self.actor(z_detach, prev_detach, stddev)
+        context_detach = context_t.detach() if context_t is not None else None
+        dist = self.actor(z_detach, context_detach, stddev)
         new_action = dist.sample(clip=self.stddev_clip)
-        actor_q1, actor_q2 = self.critic(z_detach, prev_detach, new_action)
+        actor_q1, actor_q2 = self.critic(z_detach, context_detach, new_action)
         actor_loss = -torch.min(actor_q1, actor_q2).mean()
         log_prob = dist.log_prob(new_action).sum(-1, keepdim=True)
 

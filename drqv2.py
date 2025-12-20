@@ -136,7 +136,11 @@ class DrQV2Agent:
     def __init__(self, obs_shape, action_shape, device, lr, feature_dim,
                  hidden_dim, critic_target_tau, num_expl_steps,
                  update_every_steps, stddev_schedule, stddev_clip, use_tb,
-                 action_history_len=0):
+                 action_history_len=0,
+                 goal_history_dim: int = 0,
+                 use_context_mlp: bool = False,
+                 context_hidden_dim: int = 128,
+                 context_dim: int = 64):
         self.device = device
         self.critic_target_tau = critic_target_tau
         self.update_every_steps = update_every_steps
@@ -147,10 +151,23 @@ class DrQV2Agent:
         self.action_dim = int(np.prod(action_shape))
         self.action_history_len = max(0, int(action_history_len or 0))
         self.prev_action_dim = self.action_dim * self.action_history_len
+        self.goal_history_dim = max(0, int(goal_history_dim or 0))
+        self.context_input_dim = self.prev_action_dim + self.goal_history_dim
+        self.use_context_mlp = bool(use_context_mlp) and self.context_input_dim > 0
+        self.context_dim = int(context_dim) if self.use_context_mlp else self.context_input_dim
 
         # models
         self.encoder = Encoder(obs_shape).to(device)
-        actor_input_dim = self.encoder.repr_dim + self.prev_action_dim
+        if self.use_context_mlp:
+            self.context_mlp = nn.Sequential(
+                nn.Linear(self.context_input_dim, int(context_hidden_dim)),
+                nn.ReLU(inplace=True),
+                nn.Linear(int(context_hidden_dim), self.context_dim),
+                nn.ReLU(inplace=True),
+            ).to(device)
+        else:
+            self.context_mlp = None
+        actor_input_dim = self.encoder.repr_dim + self.context_dim
         self.actor = Actor(actor_input_dim, action_shape, feature_dim,
                            hidden_dim).to(device)
         self.critic = Critic(actor_input_dim, action_shape, feature_dim,
@@ -163,6 +180,9 @@ class DrQV2Agent:
         self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=lr)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
+        self.context_opt = None
+        if self.context_mlp is not None:
+            self.context_opt = torch.optim.Adam(self.context_mlp.parameters(), lr=lr)
 
         # data augmentation
         self.aug = RandomShiftsAug(pad=4)
@@ -190,22 +210,43 @@ class DrQV2Agent:
             tensor = tensor.unsqueeze(0)
         return tensor
 
-    def _ensure_prev_tensor(self, prev_actions, batch_size):
-        if self.prev_action_dim == 0:
+    def _format_goal_history(self, goal_history, batch_size):
+        if self.goal_history_dim == 0:
             return None
-        if prev_actions is None:
+        if goal_history is None:
             return torch.zeros(batch_size,
-                               self.prev_action_dim,
+                               self.goal_history_dim,
                                device=self.device)
-        return prev_actions
+        tensor = torch.as_tensor(goal_history,
+                                 device=self.device,
+                                 dtype=torch.float32)
+        if tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0)
+        return tensor
 
-    def act(self, obs, step, eval_mode=False, prev_actions=None):
+    def _build_context(self, prev_actions, goal_history, batch_size):
+        if self.context_input_dim == 0:
+            return None
+        prev_tensor = self._format_prev_actions(prev_actions, batch_size)
+        goal_tensor = self._format_goal_history(goal_history, batch_size)
+        if prev_tensor is None and goal_tensor is None:
+            return None
+        if prev_tensor is None:
+            context_in = goal_tensor
+        elif goal_tensor is None:
+            context_in = prev_tensor
+        else:
+            context_in = torch.cat([prev_tensor, goal_tensor], dim=-1)
+        if self.context_mlp is not None:
+            return self.context_mlp(context_in)
+        return context_in
+
+    def act(self, obs, step, eval_mode=False, prev_actions=None, goal_history=None):
         obs = torch.as_tensor(obs, device=self.device)
         obs = self.encoder(obs.unsqueeze(0))
-        prev_actions_tensor = self._format_prev_actions(prev_actions,
-                                                       obs.shape[0])
+        context_tensor = self._build_context(prev_actions, goal_history, obs.shape[0])
         stddev = utils.schedule(self.stddev_schedule, step)
-        dist = self.actor(obs, prev_actions_tensor, stddev)
+        dist = self.actor(obs, context_tensor, stddev)
         if eval_mode:
             action = dist.mean
         else:
@@ -288,9 +329,13 @@ class DrQV2Agent:
         # optimize encoder and critic
         self.encoder_opt.zero_grad(set_to_none=True)
         self.critic_opt.zero_grad(set_to_none=True)
+        if self.context_opt is not None:
+            self.context_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
         self.critic_opt.step()
         self.encoder_opt.step()
+        if self.context_opt is not None:
+            self.context_opt.step()
 
         return metrics
 
@@ -337,6 +382,8 @@ class DrQV2Agent:
                 batch, self.device)
             prev_actions = None
             next_prev_actions = None
+            goal_history = None
+            next_goal_history = None
         elif len(batch) == 7:
             (obs,
              prev_actions,
@@ -345,6 +392,18 @@ class DrQV2Agent:
              discount,
              next_obs,
              next_prev_actions) = utils.to_torch(batch, self.device)
+            goal_history = None
+            next_goal_history = None
+        elif len(batch) == 9:
+            (obs,
+             prev_actions,
+             goal_history,
+             action,
+             reward,
+             discount,
+             next_obs,
+             next_prev_actions,
+             next_goal_history) = utils.to_torch(batch, self.device)
         else:
             raise ValueError(
                 f"Unexpected replay batch length {len(batch)}")
@@ -355,9 +414,11 @@ class DrQV2Agent:
         if prev_actions is not None:
             prev_actions = prev_actions.float()
             next_prev_actions = next_prev_actions.float()
-        prev_actions = self._ensure_prev_tensor(prev_actions, obs.shape[0])
-        next_prev_actions = self._ensure_prev_tensor(next_prev_actions,
-                                                     next_obs.shape[0])
+        if goal_history is not None:
+            goal_history = goal_history.float()
+            next_goal_history = next_goal_history.float()
+        prev_context = self._build_context(prev_actions, goal_history, obs.shape[0])
+        next_context = self._build_context(next_prev_actions, next_goal_history, next_obs.shape[0])
         # encode
         obs = self.encoder(obs)
         with torch.no_grad():
@@ -370,13 +431,18 @@ class DrQV2Agent:
             and isinstance(pref_batch, tuple)
             and len(pref_batch) in (3, 4)
         ):
-            if len(pref_batch) == 4:
+            if len(pref_batch) == 5:
+                pref_obs_np, pref_prev_np, pref_goal_np, pref_teacher_np, pref_student_np = pref_batch
+                pref_prev = torch.as_tensor(pref_prev_np, device=self.device).float()
+                pref_goal = torch.as_tensor(pref_goal_np, device=self.device).float()
+            elif len(pref_batch) == 4:
                 pref_obs_np, pref_prev_np, pref_teacher_np, pref_student_np = pref_batch
-                pref_prev = torch.as_tensor(pref_prev_np,
-                                            device=self.device).float()
+                pref_prev = torch.as_tensor(pref_prev_np, device=self.device).float()
+                pref_goal = None
             else:
                 pref_obs_np, pref_teacher_np, pref_student_np = pref_batch
                 pref_prev = None
+                pref_goal = None
             pref_obs = torch.as_tensor(pref_obs_np, device=self.device).float()
             pref_teacher = torch.as_tensor(pref_teacher_np, device=self.device).float()
             pref_student = torch.as_tensor(pref_student_np, device=self.device).float()
@@ -384,8 +450,10 @@ class DrQV2Agent:
             pref_obs = self.encoder(pref_obs)
             if pref_prev is not None:
                 pref_prev = pref_prev.float()
-            pref_prev = self._ensure_prev_tensor(pref_prev, pref_obs.shape[0])
-            pref_tensors = (pref_obs, pref_prev, pref_teacher, pref_student)
+            if pref_goal is not None:
+                pref_goal = pref_goal.float()
+            pref_context = self._build_context(pref_prev, pref_goal, pref_obs.shape[0])
+            pref_tensors = (pref_obs, pref_context, pref_teacher, pref_student)
 
         if self.use_tb:
             metrics['batch_reward'] = reward.mean().item()
@@ -394,12 +462,12 @@ class DrQV2Agent:
         metrics.update(
             self.update_critic(
                 obs,
-                prev_actions,
+                prev_context,
                 action,
                 reward,
                 discount,
                 next_obs,
-                next_prev_actions,
+                next_context,
                 step,
                 pref_tensors,
                 pref_weight,
@@ -408,8 +476,8 @@ class DrQV2Agent:
             ))
 
         # update actor
-        actor_prev_actions = prev_actions.detach() if prev_actions is not None else None
-        metrics.update(self.update_actor(obs.detach(), actor_prev_actions, step))
+        actor_context = prev_context.detach() if prev_context is not None else None
+        metrics.update(self.update_actor(obs.detach(), actor_context, step))
 
         # update critic target
         utils.soft_update_params(self.critic, self.critic_target,
