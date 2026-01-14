@@ -311,7 +311,13 @@ class DrQV2Agent:
             q_teacher = torch.min(teacher_q1, teacher_q2)
             q_student = torch.min(student_q1, student_q2)
             delta = q_teacher - q_student
-            if pref_loss_type == "bradley_terry":
+            if pref_loss_type == "pvp":
+                target_pos = torch.ones_like(teacher_q1)
+                target_neg = -torch.ones_like(student_q1)
+                loss_teacher = F.mse_loss(teacher_q1, target_pos) + F.mse_loss(teacher_q2, target_pos)
+                loss_student = F.mse_loss(student_q1, target_neg) + F.mse_loss(student_q2, target_neg)
+                pref_loss = 0.5 * (loss_teacher + loss_student)
+            elif pref_loss_type == "bradley_terry":
                 pref_loss = F.softplus(-delta).mean()
             else:
                 pref_loss = F.softplus(
