@@ -5,6 +5,7 @@
 import datetime
 import io
 import random
+import time
 import traceback
 from collections import defaultdict
 
@@ -102,6 +103,20 @@ class ReplayBuffer(IterableDataset):
         self._has_goal_history = False
         self._has_hidden_state = False
         self._has_warp_params = False
+        self._stats = defaultdict(float)
+        self._stats_counts = defaultdict(int)
+
+    def _record_stat(self, key, value):
+        self._stats[key] += float(value)
+        self._stats_counts[key] += 1
+
+    def get_stats(self, reset: bool = False):
+        stats = dict(self._stats)
+        counts = dict(self._stats_counts)
+        if reset:
+            self._stats = defaultdict(float)
+            self._stats_counts = defaultdict(int)
+        return stats, counts
 
     def _sample_episode(self):
         eps_fn = random.choice(self._episode_fns)
@@ -143,7 +158,9 @@ class ReplayBuffer(IterableDataset):
             worker_id = torch.utils.data.get_worker_info().id
         except:
             worker_id = 0
+        scan_start = time.perf_counter()
         eps_fns = sorted(self._replay_dir.glob('*.npz'), reverse=True)
+        self._record_stat("replay_scan_s", time.perf_counter() - scan_start)
         fetched_size = 0
         for eps_fn in eps_fns:
             eps_idx, eps_len = [int(x) for x in eps_fn.stem.split('_')[1:]]
@@ -154,8 +171,10 @@ class ReplayBuffer(IterableDataset):
             if fetched_size + eps_len > self._max_size:
                 break
             fetched_size += eps_len
+            load_start = time.perf_counter()
             if not self._store_episode(eps_fn):
                 break
+            self._record_stat("replay_load_s", time.perf_counter() - load_start)
 
     def _sample(self):
         try:
@@ -163,6 +182,7 @@ class ReplayBuffer(IterableDataset):
         except:
             traceback.print_exc()
         self._samples_since_last_fetch += 1
+        sample_start = time.perf_counter()
         episode = self._sample_episode()
         # add +1 for the first dummy transition
         idx = np.random.randint(0, episode_len(episode) - self._nstep + 1) + 1
@@ -201,7 +221,9 @@ class ReplayBuffer(IterableDataset):
             sample.append(next_hidden_state)
         if self._has_warp_params:
             sample.append(next_warp_params)
-        return tuple(sample)
+        result = tuple(sample)
+        self._record_stat("replay_sample_s", time.perf_counter() - sample_start)
+        return result
 
     def __iter__(self):
         while True:
@@ -261,8 +283,23 @@ class InMemoryReplayBuffer(IterableDataset):
         self._has_goal_history = False
         self._has_hidden_state = False
         self._has_warp_params = False
+        self._stats = defaultdict(float)
+        self._stats_counts = defaultdict(int)
+
+    def _record_stat(self, key, value):
+        self._stats[key] += float(value)
+        self._stats_counts[key] += 1
+
+    def get_stats(self, reset: bool = False):
+        stats = dict(self._stats)
+        counts = dict(self._stats_counts)
+        if reset:
+            self._stats = defaultdict(float)
+            self._stats_counts = defaultdict(int)
+        return stats, counts
 
     def _sample(self):
+        sample_start = time.perf_counter()
         episode = self._storage.sample_episode()
         if not self._has_prev_actions:
             self._has_prev_actions = 'prev_actions' in episode
@@ -308,7 +345,9 @@ class InMemoryReplayBuffer(IterableDataset):
             sample.append(next_hidden_state)
         if self._has_warp_params:
             sample.append(next_warp_params)
-        return tuple(sample)
+        result = tuple(sample)
+        self._record_stat("replay_sample_s", time.perf_counter() - sample_start)
+        return result
 
     def __iter__(self):
         while True:
