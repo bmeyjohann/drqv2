@@ -140,7 +140,12 @@ class DrQV2Agent:
                  goal_history_dim: int = 0,
                  use_context_mlp: bool = False,
                  context_hidden_dim: int = 128,
-                 context_dim: int = 64):
+                 context_dim: int = 64,
+                 pref_lambda_init: float = 0.0,
+                 pref_lambda_lr: float = 1e-3,
+                 pref_lambda_max: float = 10.0,
+                 pref_lambda_ema: float = 0.9,
+                 pref_violation_clip: float = 10.0):
         self.device = device
         self.critic_target_tau = critic_target_tau
         self.update_every_steps = update_every_steps
@@ -155,6 +160,12 @@ class DrQV2Agent:
         self.context_input_dim = self.prev_action_dim + self.goal_history_dim
         self.use_context_mlp = bool(use_context_mlp) and self.context_input_dim > 0
         self.context_dim = int(context_dim) if self.use_context_mlp else self.context_input_dim
+        self.pref_lambda = float(pref_lambda_init)
+        self.pref_lambda_lr = float(pref_lambda_lr)
+        self.pref_lambda_max = float(pref_lambda_max)
+        self.pref_lambda_ema = float(pref_lambda_ema)
+        self.pref_violation_clip = float(pref_violation_clip)
+        self._pref_violation_ema = 0.0
 
         # models
         self.encoder = Encoder(obs_shape).to(device)
@@ -271,6 +282,8 @@ class DrQV2Agent:
         pref_loss_type: str = "margin",
     ):
         metrics = dict()
+        pref_lambda_value = None
+        pref_violation_value = None
 
         with torch.no_grad():
             stddev = utils.schedule(self.stddev_schedule, step)
@@ -311,6 +324,9 @@ class DrQV2Agent:
             q_teacher = torch.min(teacher_q1, teacher_q2)
             q_student = torch.min(student_q1, student_q2)
             delta = q_teacher - q_student
+            margin_tensor = torch.as_tensor(pref_margin, device=delta.device, dtype=delta.dtype)
+            violation = torch.clamp(margin_tensor - delta, min=0.0)
+            pref_violation_value = violation.detach().mean().item()
             if pref_loss_type == "pvp":
                 target_pos = torch.ones_like(teacher_q1)
                 target_neg = -torch.ones_like(student_q1)
@@ -319,11 +335,29 @@ class DrQV2Agent:
                 pref_loss = 0.5 * (loss_teacher + loss_student)
             elif pref_loss_type == "bradley_terry":
                 pref_loss = F.softplus(-delta).mean()
+            elif pref_loss_type == "lagrangian":
+                if self.pref_violation_clip > 0.0:
+                    violation = torch.clamp(violation, max=self.pref_violation_clip)
+                if self.pref_lambda_ema > 0.0:
+                    self._pref_violation_ema = (
+                        self.pref_lambda_ema * self._pref_violation_ema
+                        + (1.0 - self.pref_lambda_ema) * float(pref_violation_value)
+                    )
+                    dual_violation = self._pref_violation_ema
+                else:
+                    dual_violation = float(pref_violation_value)
+                if self.pref_lambda_lr > 0.0:
+                    self.pref_lambda = max(0.0, self.pref_lambda + self.pref_lambda_lr * dual_violation)
+                    if self.pref_lambda_max > 0.0:
+                        self.pref_lambda = min(self.pref_lambda, self.pref_lambda_max)
+                pref_lambda_value = float(self.pref_lambda)
+                pref_loss = (pref_lambda_value * violation).mean()
             else:
                 pref_loss = F.softplus(
                     torch.as_tensor(pref_margin, device=delta.device, dtype=delta.dtype) - delta
                 ).mean()
-            critic_loss = critic_loss + float(pref_weight) * pref_loss
+            effective_weight = 1.0 if pref_loss_type == "lagrangian" else float(pref_weight)
+            critic_loss = critic_loss + effective_weight * pref_loss
 
         metrics['critic_target_q'] = target_Q.mean().item()
         metrics['critic_q1'] = Q1.mean().item()
@@ -331,6 +365,12 @@ class DrQV2Agent:
         metrics['critic_loss'] = critic_loss.item()
         if pref_loss is not None:
             metrics['pref_loss'] = pref_loss.item()
+        if pref_lambda_value is not None:
+            metrics['pref_lambda'] = pref_lambda_value
+        if pref_violation_value is not None:
+            metrics['pref_violation'] = pref_violation_value
+        if pref_loss_type == "lagrangian" and self.pref_lambda_ema > 0.0:
+            metrics['pref_violation_ema'] = float(self._pref_violation_ema)
 
         # optimize encoder and critic
         self.encoder_opt.zero_grad(set_to_none=True)
