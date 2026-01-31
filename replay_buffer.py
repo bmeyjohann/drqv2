@@ -177,11 +177,15 @@ class ReplayBuffer(IterableDataset):
             self._record_stat("replay_load_s", time.perf_counter() - load_start)
 
     def _sample(self):
-        try:
-            self._try_fetch()
-        except:
-            traceback.print_exc()
-        self._samples_since_last_fetch += 1
+        while True:
+            try:
+                self._try_fetch()
+            except:
+                traceback.print_exc()
+            self._samples_since_last_fetch += 1
+            if self._episode_fns:
+                break
+            time.sleep(0.01)
         sample_start = time.perf_counter()
         episode = self._sample_episode()
         # add +1 for the first dummy transition
