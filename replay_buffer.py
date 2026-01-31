@@ -208,6 +208,115 @@ class ReplayBuffer(IterableDataset):
             yield self._sample()
 
 
+class InMemoryReplayStorage:
+    def __init__(self, data_specs, max_size):
+        self._data_specs = data_specs
+        self._max_size = max_size
+        self._episodes = []
+        self._current_episode = defaultdict(list)
+        self._num_transitions = 0
+
+    def __len__(self):
+        return self._num_transitions
+
+    def add(self, time_step):
+        for spec in self._data_specs:
+            value = time_step[spec.name]
+            if np.isscalar(value):
+                value = np.full(spec.shape, value, spec.dtype)
+            assert spec.shape == value.shape and spec.dtype == value.dtype
+            self._current_episode[spec.name].append(value)
+        if time_step.last():
+            episode = dict()
+            for spec in self._data_specs:
+                value = self._current_episode[spec.name]
+                episode[spec.name] = np.array(value, spec.dtype)
+            self._current_episode = defaultdict(list)
+            self._store_episode(episode)
+
+    def _store_episode(self, episode):
+        eps_len = episode_len(episode)
+        self._episodes.append(episode)
+        self._num_transitions += eps_len
+        while self._num_transitions > self._max_size and self._episodes:
+            removed = self._episodes.pop(0)
+            self._num_transitions -= episode_len(removed)
+
+    def num_episodes(self):
+        return len(self._episodes)
+
+    def num_transitions(self):
+        return self._num_transitions
+
+    def sample_episode(self):
+        return random.choice(self._episodes)
+
+
+class InMemoryReplayBuffer(IterableDataset):
+    def __init__(self, storage: InMemoryReplayStorage, nstep, discount):
+        self._storage = storage
+        self._nstep = nstep
+        self._discount = discount
+        self._has_prev_actions = False
+        self._has_goal_history = False
+        self._has_hidden_state = False
+        self._has_warp_params = False
+
+    def _sample(self):
+        episode = self._storage.sample_episode()
+        if not self._has_prev_actions:
+            self._has_prev_actions = 'prev_actions' in episode
+        if not self._has_goal_history:
+            self._has_goal_history = 'goal_history' in episode
+        if not self._has_hidden_state:
+            self._has_hidden_state = 'hidden_state' in episode
+        if not self._has_warp_params:
+            self._has_warp_params = 'warp_params' in episode
+        idx = np.random.randint(0, episode_len(episode) - self._nstep + 1) + 1
+        obs = episode['observation'][idx - 1]
+        action = episode['action'][idx]
+        next_obs = episode['observation'][idx + self._nstep - 1]
+        reward = np.zeros_like(episode['reward'][idx])
+        discount = np.ones_like(episode['discount'][idx])
+        for i in range(self._nstep):
+            step_reward = episode['reward'][idx + i]
+            reward += discount * step_reward
+            discount *= episode['discount'][idx + i] * self._discount
+        sample = [obs]
+        if self._has_prev_actions:
+            prev_actions = episode['prev_actions'][idx - 1]
+            next_prev_actions = episode['prev_actions'][idx + self._nstep - 1]
+            sample.append(prev_actions)
+        if self._has_goal_history:
+            goal_history = episode['goal_history'][idx - 1]
+            next_goal_history = episode['goal_history'][idx + self._nstep - 1]
+            sample.append(goal_history)
+        if self._has_hidden_state:
+            hidden_state = episode['hidden_state'][idx - 1]
+            next_hidden_state = episode['hidden_state'][idx + self._nstep - 1]
+            sample.append(hidden_state)
+        if self._has_warp_params:
+            warp_params = episode['warp_params'][idx - 1]
+            next_warp_params = episode['warp_params'][idx + self._nstep - 1]
+            sample.append(warp_params)
+        sample.extend([action, reward, discount, next_obs])
+        if self._has_prev_actions:
+            sample.append(next_prev_actions)
+        if self._has_goal_history:
+            sample.append(next_goal_history)
+        if self._has_hidden_state:
+            sample.append(next_hidden_state)
+        if self._has_warp_params:
+            sample.append(next_warp_params)
+        return tuple(sample)
+
+    def __iter__(self):
+        while True:
+            if self._storage.num_episodes() == 0:
+                continue
+            yield self._sample()
+
+
 class SequenceReplayBuffer(IterableDataset):
     def __init__(self, replay_dir, max_size, num_workers,
                  fetch_every, save_snapshot, sequence_length, burn_in):
@@ -320,7 +429,7 @@ def _worker_init_fn(worker_id):
 
 
 def make_replay_loader(replay_dir, max_size, batch_size, num_workers,
-                       save_snapshot, nstep, discount):
+                       save_snapshot, nstep, discount, fetch_every=1000):
     max_size_per_worker = max_size // max(1, num_workers)
 
     iterable = ReplayBuffer(replay_dir,
@@ -328,7 +437,7 @@ def make_replay_loader(replay_dir, max_size, batch_size, num_workers,
                             num_workers,
                             nstep,
                             discount,
-                            fetch_every=1000,
+                            fetch_every=fetch_every,
                             save_snapshot=save_snapshot)
 
     loader = torch.utils.data.DataLoader(iterable,
@@ -340,18 +449,28 @@ def make_replay_loader(replay_dir, max_size, batch_size, num_workers,
 
 
 def make_sequence_replay_loader(replay_dir, max_size, batch_size, num_workers,
-                                save_snapshot, sequence_length, burn_in):
+                                save_snapshot, sequence_length, burn_in, fetch_every=1000):
     max_size_per_worker = max_size // max(1, num_workers)
     iterable = SequenceReplayBuffer(replay_dir,
                                     max_size_per_worker,
                                     num_workers,
-                                    fetch_every=1000,
+                                    fetch_every=fetch_every,
                                     save_snapshot=save_snapshot,
                                     sequence_length=sequence_length,
                                     burn_in=burn_in)
     loader = torch.utils.data.DataLoader(iterable,
                                          batch_size=batch_size,
                                          num_workers=num_workers,
+                                         pin_memory=True,
+                                         worker_init_fn=_worker_init_fn)
+    return loader
+
+
+def make_replay_loader_in_memory(storage, batch_size, nstep, discount):
+    iterable = InMemoryReplayBuffer(storage, nstep, discount)
+    loader = torch.utils.data.DataLoader(iterable,
+                                         batch_size=batch_size,
+                                         num_workers=0,
                                          pin_memory=True,
                                          worker_init_fn=_worker_init_fn)
     return loader
