@@ -72,6 +72,9 @@ class ReplayBufferStorage:
     def _store_episode(self, episode):
         eps_idx = self._num_episodes
         eps_len = episode_len(episode)
+        if eps_len <= 0:
+            # Episodes with no real transitions (only dummy first step) are invalid for TD sampling.
+            return
         self._num_episodes += 1
         self._num_transitions += eps_len
         ts = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
@@ -177,6 +180,7 @@ class ReplayBuffer(IterableDataset):
             self._record_stat("replay_load_s", time.perf_counter() - load_start)
 
     def _sample(self):
+        min_required_len = max(1, int(self._nstep))
         while True:
             try:
                 self._try_fetch()
@@ -187,7 +191,12 @@ class ReplayBuffer(IterableDataset):
                 break
             time.sleep(0.01)
         sample_start = time.perf_counter()
-        episode = self._sample_episode()
+        while True:
+            episode = self._sample_episode()
+            if episode_len(episode) >= min_required_len:
+                break
+            self._record_stat("replay_invalid_episode_len", episode_len(episode))
+            time.sleep(0.001)
         # add +1 for the first dummy transition
         idx = np.random.randint(0, episode_len(episode) - self._nstep + 1) + 1
         obs = episode['observation'][idx - 1]
@@ -262,6 +271,8 @@ class InMemoryReplayStorage:
 
     def _store_episode(self, episode):
         eps_len = episode_len(episode)
+        if eps_len <= 0:
+            return
         self._episodes.append(episode)
         self._num_transitions += eps_len
         while self._num_transitions > self._max_size and self._episodes:
@@ -304,7 +315,13 @@ class InMemoryReplayBuffer(IterableDataset):
 
     def _sample(self):
         sample_start = time.perf_counter()
-        episode = self._storage.sample_episode()
+        min_required_len = max(1, int(self._nstep))
+        while True:
+            episode = self._storage.sample_episode()
+            if episode_len(episode) >= min_required_len:
+                break
+            self._record_stat("replay_invalid_episode_len", episode_len(episode))
+            time.sleep(0.001)
         if not self._has_prev_actions:
             self._has_prev_actions = 'prev_actions' in episode
         if not self._has_goal_history:
